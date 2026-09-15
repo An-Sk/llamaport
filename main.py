@@ -85,8 +85,30 @@ FIELD_NOTES = {
 RAM_ONLY_SPEEDS = {
     "ornith": {"prompt_tps": 6.1, "generation_tps": 3.3},
     "gpt-oss": {"prompt_tps": 7.8, "generation_tps": 4.8},
+    "qwen3-0.6b": {"prompt_tps": 231.2, "generation_tps": 23.9},
 }
 RAM_ONLY_BASIS = "static measured CPU speeds (llama-bench pp128/tg64, 4 threads) — not live"
+
+# Static measured GPU-offload samples (llama-bench pp128/tg64, 4 threads, RX 580 Vulkan):
+# ngl = blocks offloaded to GPU; 0 = the RAM-only numbers above.
+# gpt-oss past 12 layers OOMs on the 8 GB card; ornith was measured at 0/16/25/33.
+GPU_SPEED_SAMPLES = {
+    "ornith": {
+        0: {"prompt_tps": 6.1, "generation_tps": 3.3},
+        16: {"prompt_tps": 70.4, "generation_tps": 4.2},
+        25: {"prompt_tps": 85.9, "generation_tps": 7.1},
+        33: {"prompt_tps": 69.2, "generation_tps": 15.2},
+    },
+    "gpt-oss": {
+        0: {"prompt_tps": 7.8, "generation_tps": 4.8},
+        6: {"prompt_tps": 25.3, "generation_tps": 6.8},
+        12: {"prompt_tps": 45.2, "generation_tps": 9.6},
+    },
+    "qwen3-0.6b": {
+        0: {"prompt_tps": 231.2, "generation_tps": 23.9},
+        28: {"prompt_tps": 661.1, "generation_tps": 41.7},
+    },
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("model_manager")
@@ -236,6 +258,70 @@ def _est_calc(speed: dict, prompt_tokens: int, output_tokens: int) -> dict:
         "total_seconds": round(total_seconds, 1),
         "total_minutes": round(total_seconds / 60, 1),
     }
+
+
+def _ctx_max_split(model: str, ngl: int, free_vram: int, free_ram: int) -> dict:
+    """Max ctx at ngl for each KV dtype, given current free VRAM/RAM.
+
+    KV follows its layer: layers on GPU carry their KV to VRAM, the rest to RAM.
+    ctx = min(GPU-side budget, RAM-side budget), capped by the model native limit.
+    """
+    info = _model_info(model)
+    layers = info["layers"]
+    native = info["native_ctx"]
+    w_block = (info["size_gb"] or 0) * (1024**3) / layers
+    out = {}
+    for dtype, kb in info["kv_bytes_per_token"].items():
+        kv_block = kb * 1024 / layers
+        gpu_weights = ngl * w_block
+        cpu_weights = (layers - ngl) * w_block
+        vram_avail = max(0, free_vram - gpu_weights) if free_vram else 0
+        ram_avail = max(0, free_ram - cpu_weights) if free_ram else 0
+        gpu_kv = ngl * kv_block
+        cpu_kv = (layers - ngl) * kv_block
+        vram_ctx = max(0, vram_avail) / gpu_kv if gpu_kv > 0 else float("inf")
+        ram_ctx = max(0, ram_avail) / cpu_kv if cpu_kv > 0 else float("inf")
+        out[dtype] = int(min(vram_ctx, ram_ctx, native))
+    return out
+
+
+def _interp_speeds(model: str, ngl: int) -> tuple[dict, bool]:
+    """Speeds for an arbitrary ngl: exact at measured points, linear between them,
+    clamped past the last measured point. Returns (speeds, interpolated)."""
+    pts = sorted(GPU_SPEED_SAMPLES[model].items())
+    if ngl in GPU_SPEED_SAMPLES[model]:
+        return dict(GPU_SPEED_SAMPLES[model][ngl]), False
+    if ngl <= pts[0][0]:
+        return dict(pts[0][1]), True
+    if ngl >= pts[-1][0]:
+        return dict(pts[-1][1]), True
+    for (n0, s0), (n1, s1) in zip(pts, pts[1:]):
+        if n0 <= ngl <= n1:
+            f = (ngl - n0) / (n1 - n0)
+            return {
+                "prompt_tps": round(s0["prompt_tps"] + (s1["prompt_tps"] - s0["prompt_tps"]) * f, 2),
+                "generation_tps": round(s0["generation_tps"] + (s1["generation_tps"] - s0["generation_tps"]) * f, 2),
+            }, True
+    raise AssertionError(f"ngl {ngl} not bracketed in {model} samples")
+
+
+def _best_ngl(model: str, target_ctx: int, free_vram: int, free_ram: int, kv_dtype: str = "q8_0") -> dict:
+    """Largest ngl whose ctx still fits target_ctx (fastest config that keeps the
+    needed context). If none fits, falls back to the ngl maximizing ctx."""
+    info = _model_info(model)
+    fits = None
+    for ngl in range(info["layers"], -1, -1):
+        ctx = _ctx_max_split(model, ngl, free_vram, free_ram).get(kv_dtype, 0)
+        if ctx >= target_ctx:
+            fits = (ngl, ctx)
+            break
+    if fits:
+        ngl, ctx = fits
+        return {"ngl": ngl, "ctx_max": ctx, "fits": True}
+    best = max(range(info["layers"] + 1),
+               key=lambda n: _ctx_max_split(model, n, free_vram, free_ram).get(kv_dtype, 0))
+    return {"ngl": best, "ctx_max": _ctx_max_split(model, best, free_vram, free_ram).get(kv_dtype, 0),
+            "fits": False}
 
 
 class LaunchRequest(BaseModel):
@@ -448,34 +534,110 @@ def resources():
 
 
 @app.get("/estimate")
-def estimate(model: Optional[str] = None, prompt_tokens: Optional[int] = None, output_tokens: int = 1000):
-    """Static RAM-only (CPU) time estimates from measured speeds. No live tests."""
-    if model is not None and model not in RAM_ONLY_SPEEDS:
-        raise HTTPException(404, f"no RAM-only speed data for '{model}' (have: {', '.join(RAM_ONLY_SPEEDS)})")
+def estimate(model: Optional[str] = None, prompt_tokens: Optional[int] = None,
+             output_tokens: int = 1000, gpu_layers: Optional[int] = None,
+             kv_dtype: str = "q8_0"):
+    """RAM-only time estimates + static GPU-offload profiles (measured samples,
+    linear interpolation, KV-split ctx math on live free memory). No live tests."""
+    if model is not None and model not in MODELS:
+        raise HTTPException(404, f"unknown model '{model}', available: {', '.join(MODELS)}")
     if prompt_tokens is not None and prompt_tokens < 0:
         raise HTTPException(422, "prompt_tokens must be >= 0")
     if output_tokens < 0:
         raise HTTPException(422, "output_tokens must be >= 0")
+    valid_dtypes = sorted({d for info in MODELS.values() for d in info["kv_bytes_per_token"]})
+    if kv_dtype not in valid_dtypes:
+        raise HTTPException(422, f"invalid kv_dtype '{kv_dtype}', valid: {', '.join(valid_dtypes)}")
 
     base = {"mode": "ram_only", "basis": RAM_ONLY_BASIS}
     if model is None:
         base["speeds"] = RAM_ONLY_SPEEDS
         base["presets"] = {name: _est_presets(s) for name, s in RAM_ONLY_SPEEDS.items()}
+        base["gpu_samples"] = {name: {str(n): dict(s) for n, s in sorted(pts.items())}
+                               for name, pts in GPU_SPEED_SAMPLES.items()}
         base["field_notes"] = {
             "gen_1000_min": "time to generate 1000 output tokens",
             "pp_30000_min": "time to process a 30k-token prompt",
             "pp_60000_min": "time to process a 60k-token prompt",
             "turn_30000_1000_min": "process 30k prompt then generate 1k tokens",
             "turn_60000_1000_min": "process 60k prompt then generate 1k tokens",
+            "gpu_samples": "benchmarked ngl (gpu_layers) points per model — speeds for other ngl values are linearly interpolated when you query that model",
         }
         return base
 
-    speed = RAM_ONLY_SPEEDS[model]
+    speed = RAM_ONLY_SPEEDS.get(model) or GPU_SPEED_SAMPLES[model][0]
     base["model"] = model
     base["speeds"] = speed
     base["presets"] = _est_presets(speed)
     if prompt_tokens is not None:
         base["estimate"] = _est_calc(speed, prompt_tokens, output_tokens)
+
+    info = _model_info(model)
+    ram = ram_info()
+    devs = vram_devices()
+    best_vram = max(devs, key=lambda d: d["total_bytes"]) if devs else None
+    free_ram = ram["free_bytes"] if ram else 0
+    free_vram = best_vram["free_bytes"] if best_vram else 0
+
+    partial = {
+        "basis": ("measured ngl samples (llama-bench pp128/tg64, 4 threads, RX 580 Vulkan) + linear "
+                  "interpolation; `ctx_max` splits each device's weight+KV budget by ngl "
+                  "(a layer's KV lives on the same device as its layer) using live free VRAM/RAM"),
+        "measured_points": {str(n): dict(s) for n, s in sorted(GPU_SPEED_SAMPLES[model].items())},
+    }
+    if best_vram:
+        partial["ctx_current"] = {
+            "ram_free_bytes": free_ram,
+            "vram_free_bytes": free_vram,
+            "ngl_blocks_limit": info["layers"],
+        }
+        partial["ctx_max_by_ngl"] = {
+            str(n): _ctx_max_split(model, n, free_vram, free_ram)
+            for n in sorted(GPU_SPEED_SAMPLES[model])
+        }
+    else:
+        partial["basis"] += " — Vulkan device unavailable, so ctx_max/ctx limits are omitted"
+
+    if gpu_layers is not None:
+        if gpu_layers < 0 or gpu_layers > info["layers"]:
+            raise HTTPException(422, f"gpu_layers must be 0..{info['layers']} for '{model}'")
+        chosen = gpu_layers
+        chosen_speeds, interp = _interp_speeds(model, chosen)
+    else:
+        target = (prompt_tokens or 0) + output_tokens if prompt_tokens is not None else info["native_ctx"]
+        rec = _best_ngl(model, target, free_vram, free_ram, kv_dtype)
+        chosen = rec["ngl"]
+        chosen_speeds, interp = _interp_speeds(model, chosen)
+        partial["recommended"] = {
+            "ngl": rec["ngl"],
+            "kv_dtype": kv_dtype,
+            "target_ctx": target,
+            "fits": rec["fits"],
+            "ctx_max": rec["ctx_max"],
+            "speeds": chosen_speeds,
+            "interpolated": interp,
+        }
+
+    profile = {"ngl": chosen, "interpolated": interp, "speeds": chosen_speeds}
+    if best_vram:
+        profile["ctx_max"] = _ctx_max_split(model, chosen, free_vram, free_ram)
+    if prompt_tokens is not None:
+        profile["tokens"] = {"prompt_tokens": prompt_tokens, "output_tokens": output_tokens}
+        profile["estimate"] = _est_calc(chosen_speeds, prompt_tokens, output_tokens)
+    partial["profile"] = profile
+
+    partial["params"] = {
+        "gpu_layers": f"blocks offloaded to GPU, 0..{info['layers']}. Each GPU layer's KV must live in VRAM, so more offload = faster generation but a smaller max context. Pass it to pin an exact split; omit it to get the recommended largest fit.",
+        "kv_dtype": f"KV-cache dtype used to size the context budget (this endpoint's default q8_0; valid: {', '.join(valid_dtypes)}). q8_0 is the llama.cpp sweet spot — ~2x smaller than f16, near-lossless.",
+        "prompt_tokens": "input tokens to process. Batched, so this is where the GPU helps most; it mostly shapes the `recommended` ngl.",
+        "output_tokens": "tokens to generate serially — each one passes through every layer on both devices, so this mostly sets your wait time.",
+        "interpolated": "true when ngl isn't a benchmarked point — speeds are a linear guess between the two neighboring measured points (clamped beyond the last one).",
+        "ctx_max": "max context tokens that fit both devices at that ngl for each KV dtype, from current free VRAM/RAM; capped by the model's native limit.",
+        "ctx_max_by_ngl": "the same ctx_max evaluated at every benchmarked ngl, so you can see the offload-vs-context trade-off curve.",
+        "recommended": "largest ngl whose ctx_max(kv_dtype) >= target_ctx (= prompt_tokens+output_tokens, or the model's full native ctx when you pass no tokens): the most GPU offload that still keeps the needed context. fits=false means even the best ngl can't hold it.",
+        "estimate": "seconds/minutes for the requested tokens at that profile, using its (possibly interpolated) speeds.",
+    }
+    base["partial_gpu"] = partial
     return base
 
 
@@ -595,7 +757,11 @@ async def proxy(path: str, request: Request, authorization: Optional[str] = Head
 
     url = f"http://127.0.0.1:{inst.port}/v1/{path}"
     headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length", "connection", "accept-encoding")}
-    stream = body.get("stream", False) if request.method == "POST" and body else False
+    stream = False
+    if request.method == "POST" and body:
+        stream = bool(body.get("stream", False))
+    stream = stream or request.query_params.get("stream") in ("true", "1")
+    stream = stream or "text/event-stream" in request.headers.get("accept", "")
 
     async def gen():
         async with _client.stream(request.method, url, content=raw, headers=headers, params=dict(request.query_params)) as resp:
