@@ -80,6 +80,14 @@ FIELD_NOTES = {
     "ctv": "KV-cache dtype for V half (None → f16)",
 }
 
+# Static measured speeds, RAM-only (CPU) mode: llama-bench pp128/tg64,
+# 4 threads, i5-3470 (see llm-theory/hardware-and-measurements.md).
+RAM_ONLY_SPEEDS = {
+    "ornith": {"prompt_tps": 6.1, "generation_tps": 3.3},
+    "gpt-oss": {"prompt_tps": 7.8, "generation_tps": 4.8},
+}
+RAM_ONLY_BASIS = "static measured CPU speeds (llama-bench pp128/tg64, 4 threads) — not live"
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("model_manager")
 
@@ -201,6 +209,33 @@ def fits_map(free_bytes):
             if isinstance(kb, (int, float)) and kb > 0
         }
     return fits
+
+
+def _est_presets(speed: dict) -> dict:
+    """Precomputed RAM-only time presets (minutes) for one model."""
+    pp, gen = speed["prompt_tps"], speed["generation_tps"]
+    return {
+        "gen_1000_min": round(1000 / gen / 60, 1),
+        "pp_30000_min": round(30000 / pp / 60, 1),
+        "pp_60000_min": round(60000 / pp / 60, 1),
+        "turn_30000_1000_min": round(30000 / pp / 60 + 1000 / gen / 60, 1),
+        "turn_60000_1000_min": round(60000 / pp / 60 + 1000 / gen / 60, 1),
+    }
+
+
+def _est_calc(speed: dict, prompt_tokens: int, output_tokens: int) -> dict:
+    pp, gen = speed["prompt_tps"], speed["generation_tps"]
+    prompt_seconds = prompt_tokens / pp
+    gen_seconds = output_tokens / gen
+    total_seconds = prompt_seconds + gen_seconds
+    return {
+        "prompt_tokens": prompt_tokens,
+        "output_tokens": output_tokens,
+        "prompt_seconds": round(prompt_seconds, 1),
+        "generation_seconds": round(gen_seconds, 1),
+        "total_seconds": round(total_seconds, 1),
+        "total_minutes": round(total_seconds / 60, 1),
+    }
 
 
 class LaunchRequest(BaseModel):
@@ -410,6 +445,38 @@ def resources():
             "max context (tokens) so weights + KV of that dtype still fit current free RAM (CPU-only load)"
         )
     return out
+
+
+@app.get("/estimate")
+def estimate(model: Optional[str] = None, prompt_tokens: Optional[int] = None, output_tokens: int = 1000):
+    """Static RAM-only (CPU) time estimates from measured speeds. No live tests."""
+    if model is not None and model not in RAM_ONLY_SPEEDS:
+        raise HTTPException(404, f"no RAM-only speed data for '{model}' (have: {', '.join(RAM_ONLY_SPEEDS)})")
+    if prompt_tokens is not None and prompt_tokens < 0:
+        raise HTTPException(422, "prompt_tokens must be >= 0")
+    if output_tokens < 0:
+        raise HTTPException(422, "output_tokens must be >= 0")
+
+    base = {"mode": "ram_only", "basis": RAM_ONLY_BASIS}
+    if model is None:
+        base["speeds"] = RAM_ONLY_SPEEDS
+        base["presets"] = {name: _est_presets(s) for name, s in RAM_ONLY_SPEEDS.items()}
+        base["field_notes"] = {
+            "gen_1000_min": "time to generate 1000 output tokens",
+            "pp_30000_min": "time to process a 30k-token prompt",
+            "pp_60000_min": "time to process a 60k-token prompt",
+            "turn_30000_1000_min": "process 30k prompt then generate 1k tokens",
+            "turn_60000_1000_min": "process 60k prompt then generate 1k tokens",
+        }
+        return base
+
+    speed = RAM_ONLY_SPEEDS[model]
+    base["model"] = model
+    base["speeds"] = speed
+    base["presets"] = _est_presets(speed)
+    if prompt_tokens is not None:
+        base["estimate"] = _est_calc(speed, prompt_tokens, output_tokens)
+    return base
 
 
 @app.post("/launch")
