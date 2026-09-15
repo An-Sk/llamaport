@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import secrets
 import socket
 import subprocess
@@ -21,6 +22,7 @@ IDLE_TIMEOUT_MINUTES = 60
 LOW_PORT = 8100
 HIGH_PORT = 8900
 CREATE_NO_WINDOW = 0x08000000
+VALID_KV_TYPES = {"f16", "f32", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "i8", "i16", "i32"}
 
 BIN_CPU = r"D:\llms\llama-b10809-bin-win-cpu-x64\llama-server.exe"
 BIN_VULKAN = r"D:\llms\llama-b10809-bin-win-vulkan-x64\llama-server.exe"
@@ -31,26 +33,62 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 MODELS = {
     "ornith": {
         "path": r"D:\llms\models\testing\ornith-ai_Ornith-1.5-9B-GGUF\Ornith-1.5-9B-Q4_K_M.gguf",
-        "description": "Ornith-1.5-9B (qwen35), strong tool calling",
+        "description": "Ornith-1.5-9B (qwen35), 33 blocks, native 262k ctx, strong tool calling",
         "ctx": 4096,
         "jinja": True,
+        "quant": "Q4_K_M",
+        "quant_pct": "~30",
+        "layers": 33,
+        "native_ctx": 262144,
+        "kv_bytes_per_token": {"f16": 36, "q8_0": 18, "q4_0": 9},
     },
     "gpt-oss": {
         "path": r"D:\llms\models\testing\unsloth_gpt-oss-20b-GGUF\gpt-oss-20b-Q4_K_M.gguf",
-        "description": "OpenAI gpt-oss-20b MoE (20B total / 3.6B active)",
+        "description": "OpenAI gpt-oss-20b MoE (20B total / 3.6B active per token), 24 blocks, native 131k ctx",
         "ctx": 2048,
         "jinja": True,
+        "quant": "Q4_K_M",
+        "quant_pct": "~28",
+        "layers": 24,
+        "native_ctx": 131072,
+        "kv_bytes_per_token": {"f16": 48, "q8_0": 24, "q4_0": 12},
     },
     "qwen3-0.6b": {
         "path": r"D:\llms\models\testing\Qwen_Qwen3-0.6B-GGUF\Qwen3-0.6B-Q8_0.gguf",
-        "description": "Tiny Qwen3-0.6B for quick sanity checks",
+        "description": "Tiny Qwen3-0.6B (28 blocks), quick sanity checks",
         "ctx": 4096,
         "jinja": True,
+        "quant": "Q8_0",
+        "quant_pct": "~50",
+        "layers": 28,
+        "native_ctx": 40960,
+        "kv_bytes_per_token": {"f16": 112, "q8_0": 56, "q4_0": 28},
     },
+}
+
+FIELD_NOTES = {
+    "quant": "weight quant format (baked into file)",
+    "quant_pct": "file size as % of the fp16 original",
+    "layers": "total blocks = max value for gpu_layers",
+    "ctx": "default context window in tokens (input+output share it)",
+    "native_ctx": "model's absolute max context window",
+    "kv_bytes_per_token": "KV-cache RAM needed per token (KB), per f16/q8_0/q4_0",
+    "size_gb": "file size on disk",
+    "gpu_layers": "blocks offloaded to GPU (0 = CPU only)",
+    "ctk": "KV-cache dtype for K half (None → f16)",
+    "ctv": "KV-cache dtype for V half (None → f16)",
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("model_manager")
+
+
+def _model_info(name: str) -> dict:
+    """Registry entry + live file size, so /models exposes quant/layers/KV facts."""
+    info = dict(MODELS[name])
+    path = Path(info["path"])
+    info["size_gb"] = round(os.path.getsize(path) / (1024**3), 2) if path.exists() else None
+    return info
 
 
 class LaunchRequest(BaseModel):
@@ -58,6 +96,8 @@ class LaunchRequest(BaseModel):
     gpu_layers: int = 0
     ctx: Optional[int] = None
     threads: int = 4
+    ctk: Optional[str] = None
+    ctv: Optional[str] = None
 
 
 class StopRequest(BaseModel):
@@ -66,7 +106,7 @@ class StopRequest(BaseModel):
 
 
 class Instance:
-    def __init__(self, model, port, secret, proc, stdout_log, stderr_log, gpu_layers, ctx, threads):
+    def __init__(self, model, port, secret, proc, stdout_log, stderr_log, gpu_layers, ctx, threads, ctk=None, ctv=None):
         self.model = model
         self.port = port
         self.secret = secret
@@ -76,6 +116,8 @@ class Instance:
         self.gpu_layers = gpu_layers
         self.ctx = ctx
         self.threads = threads
+        self.ctk = ctk
+        self.ctv = ctv
         self.status = "starting"
         self.started = time.time()
         self.last_active = time.time()
@@ -88,6 +130,8 @@ class Instance:
             "gpu_layers": self.gpu_layers,
             "ctx": self.ctx,
             "threads": self.threads,
+            "cache_type_k": self.ctk,
+            "cache_type_v": self.ctv,
             "started": datetime.fromtimestamp(self.started, tz=timezone.utc).isoformat(),
             "last_active": datetime.fromtimestamp(self.last_active, tz=timezone.utc).isoformat(),
             "idle_seconds_left": max(0, int(IDLE_TIMEOUT_MINUTES * 60 - (time.time() - self.last_active))),
@@ -127,7 +171,7 @@ def detect_ip():
     return get_lan_ip()
 
 
-def build_cmd(name, port, gpu_layers, ctx, threads, stdout, stderr):
+def build_cmd(name, port, gpu_layers, ctx, threads, ctk=None, ctv=None):
     spec = MODELS[name]
     binary = BIN_VULKAN if gpu_layers > 0 else BIN_CPU
     cmd = [
@@ -142,6 +186,10 @@ def build_cmd(name, port, gpu_layers, ctx, threads, stdout, stderr):
         cmd.append("--jinja")
     if gpu_layers > 0:
         cmd += ["--device", "Vulkan0", "-ngl", str(gpu_layers)]
+    if ctk:
+        cmd += ["-ctk", ctk]
+    if ctv:
+        cmd += ["-ctv", ctv]
     return cmd
 
 
@@ -219,20 +267,28 @@ def root():
         "api_port": API_PORT,
         "api_base": f"http://{detect_ip()}:{API_PORT}/v1",
         "idle_timeout_minutes": IDLE_TIMEOUT_MINUTES,
-        "models": MODELS,
+        "models": {name: _model_info(name) for name in MODELS},
         "launch": f"POST http://{detect_ip()}:{API_PORT}/launch  {{'model': 'ornith'}}",
     }
 
 
 @app.get("/models")
 def list_models():
-    return {"running": {k: v.info() for k, v in RUNNING.items()}, "available": MODELS}
+    return {
+        "running": {k: v.info() for k, v in RUNNING.items()},
+        "available": {name: _model_info(name) for name in MODELS},
+        "field_notes": FIELD_NOTES,
+    }
 
 
 @app.post("/launch")
 async def launch(req: LaunchRequest):
     if req.model not in MODELS:
         raise HTTPException(404, f"unknown model '{req.model}', available: {', '.join(MODELS)}")
+    if req.ctk and req.ctk not in VALID_KV_TYPES:
+        raise HTTPException(422, f"invalid ctk '{req.ctk}', valid: {', '.join(sorted(VALID_KV_TYPES))}")
+    if req.ctv and req.ctv not in VALID_KV_TYPES:
+        raise HTTPException(422, f"invalid ctv '{req.ctv}', valid: {', '.join(sorted(VALID_KV_TYPES))}")
     if req.model in RUNNING:
         inst = RUNNING[req.model]
         return _launch_response(inst, already=True)
@@ -241,14 +297,15 @@ async def launch(req: LaunchRequest):
     secret = secrets.token_urlsafe(16)
     stdout_log = LOG_DIR / f"{req.model}-{port}.out.log"
     stderr_log = LOG_DIR / f"{req.model}-{port}.err.log"
-    cmd = build_cmd(req.model, port, req.gpu_layers, ctx, req.threads, stdout_log, stderr_log)
-    logger.info("launching %s on port %s (gpu_layers=%s) cmd=%s", req.model, port, req.gpu_layers, " ".join(cmd))
+    cmd = build_cmd(req.model, port, req.gpu_layers, ctx, req.threads, req.ctk, req.ctv)
+    logger.info("launching %s on port %s (gpu_layers=%s, ctk=%s, ctv=%s) cmd=%s",
+                req.model, port, req.gpu_layers, req.ctk, req.ctv, " ".join(cmd))
     stdout_f = open(stdout_log, "w", encoding="utf-8", errors="replace")
     stderr_f = open(stderr_log, "w", encoding="utf-8", errors="replace")
     proc = subprocess.Popen(cmd, stdout=stdout_f, stderr=stderr_f,
                             creationflags=CREATE_NO_WINDOW)
     inst = Instance(req.model, port, secret, proc, stdout_log, stderr_log,
-                    req.gpu_layers, ctx, req.threads)
+                    req.gpu_layers, ctx, req.threads, req.ctk, req.ctv)
     RUNNING[req.model] = inst
     if await wait_healthy(port):
         inst.status = "running"
@@ -274,6 +331,8 @@ def _launch_response(inst: Instance, already: bool = False):
             "model": inst.model,
         },
         "idle_timeout_minutes": IDLE_TIMEOUT_MINUTES,
+        "cache_type_k": inst.ctk,
+        "cache_type_v": inst.ctv,
         "stdout_log": str(inst.stdout_log),
         "stderr_log": str(inst.stderr_log),
     }
