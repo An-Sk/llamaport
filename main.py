@@ -289,11 +289,17 @@ async def launch(req: LaunchRequest):
         raise HTTPException(422, f"invalid ctk '{req.ctk}', valid: {', '.join(sorted(VALID_KV_TYPES))}")
     if req.ctv and req.ctv not in VALID_KV_TYPES:
         raise HTTPException(422, f"invalid ctv '{req.ctv}', valid: {', '.join(sorted(VALID_KV_TYPES))}")
+    spec = MODELS[req.model]
+    if req.ctx is not None:
+        if req.ctx < 1:
+            raise HTTPException(422, "ctx must be >= 1")
+        if req.ctx > spec["native_ctx"]:
+            raise HTTPException(422, f"ctx {req.ctx} exceeds '{req.model}' native limit {spec['native_ctx']}")
     if req.model in RUNNING:
         inst = RUNNING[req.model]
         return _launch_response(inst, already=True)
     port = free_port()
-    ctx = req.ctx or MODELS[req.model]["ctx"]
+    ctx = req.ctx or spec["ctx"]
     secret = secrets.token_urlsafe(16)
     stdout_log = LOG_DIR / f"{req.model}-{port}.out.log"
     stderr_log = LOG_DIR / f"{req.model}-{port}.err.log"
