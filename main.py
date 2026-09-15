@@ -1,4 +1,5 @@
 import asyncio
+import ctypes
 import json
 import logging
 import os
@@ -89,6 +90,117 @@ def _model_info(name: str) -> dict:
     path = Path(info["path"])
     info["size_gb"] = round(os.path.getsize(path) / (1024**3), 2) if path.exists() else None
     return info
+
+
+class _MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", ctypes.c_uint32),
+        ("dwMemoryLoad", ctypes.c_uint32),
+        ("ullTotalPhys", ctypes.c_uint64),
+        ("ullAvailPhys", ctypes.c_uint64),
+        ("ullTotalPageFile", ctypes.c_uint64),
+        ("ullAvailPageFile", ctypes.c_uint64),
+        ("ullTotalVirtual", ctypes.c_uint64),
+        ("ullAvailVirtual", ctypes.c_uint64),
+        ("ullAvailExtendedVirtual", ctypes.c_uint64),
+    ]
+
+
+def ram_info():
+    """Available RAM via GlobalMemoryStatusEx (pure stdlib ctypes)."""
+    ms = _MEMORYSTATUSEX()
+    ms.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+        return None
+    return {
+        "load_percent": ms.dwMemoryLoad,
+        "total_bytes": ms.ullTotalPhys,
+        "free_bytes": ms.ullAvailPhys,
+        "used_bytes": ms.ullTotalPhys - ms.ullAvailPhys,
+    }
+
+
+_VK_BINDIR = str(Path(BIN_VULKAN).parent)
+_vk_loaded = False
+_vk_lib = None
+_vk_dir_handle = None
+
+
+def _load_vk_lib():
+    """Load ggml-vulkan.dll from the Vulkan bin folder (lazy, pure stdlib)."""
+    global _vk_loaded, _vk_lib, _vk_dir_handle
+    if _vk_loaded:
+        return _vk_lib
+    _vk_loaded = True
+    dll_path = os.path.join(_VK_BINDIR, "ggml-vulkan.dll")
+    if not os.path.exists(dll_path):
+        logger.warning("no ggml-vulkan.dll in %s", _VK_BINDIR)
+        return None
+    try:
+        _vk_dir_handle = os.add_dll_directory(_VK_BINDIR)
+        ctypes.CDLL(os.path.join(_VK_BINDIR, "ggml-base.dll"))
+        ctypes.CDLL(os.path.join(_VK_BINDIR, "ggml.dll"))
+        lib = ctypes.CDLL(dll_path)
+        lib.ggml_backend_vk_get_device_count.restype = ctypes.c_int
+        lib.ggml_backend_vk_get_device_count.argtypes = []
+        lib.ggml_backend_vk_get_device_memory.restype = None
+        lib.ggml_backend_vk_get_device_memory.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        _vk_lib = lib
+    except Exception as ex:
+        logger.warning("vulkan VRAM probe load failed: %s", ex)
+    return _vk_lib
+
+
+def vram_devices():
+    """Free/total VRAM per Vulkan device via ggml_backend_vk_get_device_memory."""
+    lib = _load_vk_lib()
+    if lib is None:
+        return None
+    try:
+        devices = []
+        for i in range(lib.ggml_backend_vk_get_device_count()):
+            free = ctypes.c_size_t(0)
+            total = ctypes.c_size_t(0)
+            lib.ggml_backend_vk_get_device_memory(i, ctypes.byref(free), ctypes.byref(total))
+            devices.append({
+                "device": i,
+                "total_bytes": total.value,
+                "free_bytes": free.value,
+                "used_bytes": total.value - free.value,
+            })
+        return devices
+    except Exception as ex:
+        logger.warning("vulkan VRAM probe failed: %s", ex)
+        return None
+
+
+def _max_ctx(free_bytes, weights_bytes, kv_kb):
+    """Max context (tokens) so weights + KV fit in the given free memory."""
+    if not free_bytes or not kv_kb or kv_kb <= 0:
+        return 0
+    avail = free_bytes - weights_bytes
+    if avail <= 0:
+        return 0
+    return int(avail / (kv_kb * 1024))
+
+
+def fits_map(free_bytes):
+    """Per-model max ctx (tokens) for each KV dtype, for a given free budget."""
+    fits = {}
+    for name in MODELS:
+        info = _model_info(name)
+        kv = info.get("kv_bytes_per_token") or {}
+        weights_bytes = int((info.get("size_gb") or 0) * (1024**3))
+        fits[name] = {
+            dtype: _max_ctx(free_bytes, weights_bytes, kb)
+            for dtype, kb in kv.items()
+            if isinstance(kb, (int, float)) and kb > 0
+        }
+    return fits
 
 
 class LaunchRequest(BaseModel):
@@ -279,6 +391,25 @@ def list_models():
         "available": {name: _model_info(name) for name in MODELS},
         "field_notes": FIELD_NOTES,
     }
+
+
+@app.get("/resources")
+def resources():
+    ram = ram_info()
+    vram = vram_devices()
+    out = {"ram": ram, "vram": vram}
+    if vram:
+        best = max(vram, key=lambda d: d["total_bytes"])
+        out["fits_full_gpu"] = fits_map(best["free_bytes"])
+        out["field_notes"] = {
+            "fits_full_gpu": "max context (tokens) so weights + KV of that dtype still fit current free VRAM",
+        }
+    if ram:
+        out["fits_ram"] = fits_map(ram["free_bytes"])
+        out.setdefault("field_notes", {})["fits_ram"] = (
+            "max context (tokens) so weights + KV of that dtype still fit current free RAM (CPU-only load)"
+        )
+    return out
 
 
 @app.post("/launch")
